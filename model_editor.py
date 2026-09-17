@@ -141,7 +141,9 @@ class RigScene(QGraphicsScene):
                 m_pos = event.scenePos()
                 current_angle = math.atan2(m_pos.y() - n_pos.y(), m_pos.x() - n_pos.x())
                 diff_deg = math.degrees(current_angle - self.angle_offset)
-                self.manip_node.setRotation(self.node_start_rot + diff_deg)
+                limit = self.manip_node.rotation_limit
+                rotation = max(-limit, min(limit, self.node_start_rot + diff_deg))
+                self.manip_node.setRotation(rotation)
                     
             event.accept()
             return
@@ -189,6 +191,7 @@ class BoneNode(QGraphicsObject):
         self.image_rotation = 0.0
         self.image_offset = QPointF(0.0, 0.0)   # pivot/offset of the image, in this bone's local space
         self.image_z = 0                        # GLOBAL z-level for the image (independent of bone hierarchy)
+        self.rotation_limit = 360.0
         
         self.setFlags(QGraphicsItem.ItemIsSelectable | QGraphicsItem.ItemSendsGeometryChanges)
         self.setZValue(0)
@@ -261,6 +264,10 @@ class BoneNode(QGraphicsObject):
             not subject to parent/child override -- it's a flat, whole-rig stacking order. """
         self.image_z = z
         self.pixmap_item.setZValue(z)
+
+    def set_rotation_limit(self, limit):
+        self.rotation_limit = max(0.0, abs(float(limit)))
+        self.setRotation(max(-self.rotation_limit, min(self.rotation_limit, self.rotation())))
 
     def sync_pixmap(self):
         """ Recomputes the world transform for this bone's (detached) pixmap item, from:
@@ -460,10 +467,11 @@ class PuppetEditor(QMainWindow):
         z_panel_layout = QVBoxLayout()
         
         self.z_table = QTableWidget()
-        self.z_table.setColumnCount(2)
-        self.z_table.setHorizontalHeaderLabels(["Bone Name", "Z-Level"])
+        self.z_table.setColumnCount(3)
+        self.z_table.setHorizontalHeaderLabels(["Bone Name", "Z-Level", "Max Rotation"])
         self.z_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.z_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.z_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.z_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.z_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.z_table.itemSelectionChanged.connect(self.on_z_table_selection)
@@ -528,6 +536,16 @@ class PuppetEditor(QMainWindow):
             spin.setValue(int(node.image_z))
             spin.valueChanged.connect(lambda val, n=node: self.on_z_table_value_change(n, val))
             self.z_table.setCellWidget(row, 1, spin)
+
+            rotation_limit = QDoubleSpinBox()
+            rotation_limit.setRange(0.0, 360.0)
+            rotation_limit.setDecimals(1)
+            rotation_limit.setSingleStep(1.0)
+            rotation_limit.setValue(node.rotation_limit)
+            rotation_limit.valueChanged.connect(
+                lambda val, n=node: self.on_rotation_limit_change(n, val)
+            )
+            self.z_table.setCellWidget(row, 2, rotation_limit)
             
             if selected_name and node.name == selected_name:
                 select_row = row
@@ -582,6 +600,12 @@ class PuppetEditor(QMainWindow):
     def on_z_table_value_change(self, node, value):
         """ Triggered when a spinbox value inside the Z-Order sidebar is changed. """
         node.set_image_z(value)
+        self.scene.update()
+        self.update_info_hud()
+
+    def on_rotation_limit_change(self, node, value):
+        node.set_rotation_limit(value)
+        node.sync_subtree_pixmaps()
         self.scene.update()
         self.update_info_hud()
 
@@ -802,7 +826,8 @@ class PuppetEditor(QMainWindow):
                 self.tree.addTopLevelItem(self.tree_items[name])
                 
             node.setPos(b_data.get("local_x", 0), b_data.get("local_y", 0))
-            node.setRotation(b_data.get("rotation", 0))
+            node.set_rotation_limit(b_data.get("rotation_limit", 360.0))
+            node.setRotation(max(-node.rotation_limit, min(node.rotation_limit, b_data.get("rotation", 0))))
             node.set_image_z(b_data.get("z_value", 0))
             
             for p in b_data.get("image_paths", []):
@@ -850,6 +875,7 @@ class PuppetEditor(QMainWindow):
                 "local_x": round(node.pos().x(), 2),
                 "local_y": round(node.pos().y(), 2),
                 "rotation": round(node.rotation(), 2),
+                "rotation_limit": round(node.rotation_limit, 2),
                 "image_paths": node.image_paths, 
                 "expression_index": node.expression_index,
                 "flip_h": node.flip_h,

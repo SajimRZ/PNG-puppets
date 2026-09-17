@@ -60,6 +60,7 @@ Each bone can have multiple PNGs used as expressions. The editor supports:
 - Expression selection
 - Horizontal and vertical flips
 - Image base rotation from `-360` to `360` degrees
+- Per-bone maximum pose rotation, stored as `rotation_limit`
 - Image pivot offsets
 - A global image Z-level independent of the bone hierarchy
 
@@ -74,6 +75,7 @@ one. The exported file uses this structure:
             "local_x": 0.0,
             "local_y": 0.0,
             "rotation": 0.0,
+            "rotation_limit": 360.0,
             "image_paths": ["faces/example.png"],
             "expression_index": 0,
             "flip_h": false,
@@ -132,3 +134,36 @@ The runtime also recognizes these control tags through `PuppetController`:
 
 They rotate a named bone or select an expression index when passed to
 `parse_llm_stream`.
+
+## External controller script
+
+The renderer starts a localhost command server on `127.0.0.1:8765`. Start the
+renderer first, then run the random controller in a second terminal:
+
+```powershell
+python model_desktop_render.py
+python random_controller.py
+```
+
+`random_controller.py` sends random rotations, face expressions, and model movement
+commands while both programs run concurrently. Stop it with `Ctrl+C`. Its options are:
+
+```powershell
+python random_controller.py --interval 1.0 --min-x 100 --max-x 1400
+```
+
+The controller understands these command tags:
+
+```text
+<rotate:head=20>
+<expr:face=3>
+<move:x=800,speed=400>
+```
+
+`<move:x=800,speed=400>` smoothly moves the entire avatar window to screen X position
+`800` at `400` pixels per second. The speed is optional and defaults to `300` pixels per
+second. The `PuppetController` method that performs the same action inside Python is:
+
+```python
+controller.move_model_x(800, speed=400)
+```

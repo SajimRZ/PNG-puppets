@@ -2,6 +2,8 @@ import sys
 import json
 import os
 import re
+import socket
+import threading
 import time
 import ctypes
 from ctypes import wintypes
@@ -12,7 +14,7 @@ from PyQt6.QtGui import QImage, QPixmap, QTransform, QScreen
 
 
 # --- Easy tuning variables ---
-MODEL_SCALE = 0.2
+MODEL_SCALE = 0.15
 MODEL_PADDING = 24
 PHYSICS_FPS = 60
 GRAVITY = 2800.0
@@ -25,7 +27,7 @@ DROP_FACTOR = 0.02
 THROW_STRENGTH = 0.55
 MAX_THROW_SPEED_X = 1000.0
 MAX_THROW_SPEED_Y = 1000.0
-PLATFORM_Y = 475  # Set a screen Y coordinate, or use None for the screen bottom.
+PLATFORM_Y = 560  # Set a screen Y coordinate, or use None for the screen bottom.
 
 
 class ImageAssetCache:
@@ -160,6 +162,8 @@ class PhysicsThread(QThread):
         self.floor_y = screen_h if PLATFORM_Y is None else PLATFORM_Y
         self.x, self.y = 0.0, 0.0
         self.vx, self.vy = 0.0, 0.0
+        self.target_x = None
+        self.target_x_speed = 300.0
         
         # Kinematic constants
         self.gravity = GRAVITY
@@ -181,6 +185,10 @@ class PhysicsThread(QThread):
         self.x, self.y = float(x), float(y)
         self.last_time = now
 
+    def move_to_x(self, x_position, speed):
+        self.target_x = max(0.0, min(float(self.screen_w), float(x_position)))
+        self.target_x_speed = max(1.0, abs(float(speed)))
+
     def run(self):
         fps = PHYSICS_FPS
         target_delta = 1.0 / fps
@@ -193,8 +201,20 @@ class PhysicsThread(QThread):
             if not self.is_dragging:
                 # Apply gravity and velocity
                 self.vy += self.gravity * delta
+
+                if self.target_x is not None:
+                    distance = self.target_x - self.x
+                    step = self.target_x_speed * delta
+                    if abs(distance) <= step:
+                        self.x = self.target_x
+                        self.target_x = None
+                        self.vx = 0
+                    else:
+                        self.vx = self.target_x_speed if distance > 0 else -self.target_x_speed
+                        self.x += self.vx * delta
+                else:
+                    self.x += self.vx * delta
                 
-                self.x += self.vx * delta
                 self.y += self.vy * delta
                 
                 # Floor collision logic
@@ -227,7 +247,11 @@ class RigBone(QGraphicsObject):
         super().__init__()
         self.data = data
         self.asset_cache = asset_cache
-        self.base_rotation = data.get("rotation", 0)  # Cached for dynamic offset during swings
+        self.rotation_limit = max(0.0, abs(float(data.get("rotation_limit", 360.0))))
+        self.base_rotation = max(
+            -self.rotation_limit,
+            min(self.rotation_limit, float(data.get("rotation", 0))),
+        )
         self.setPos(data.get("local_x", 0), data.get("local_y", 0))
         self.setRotation(self.base_rotation)
         
@@ -375,7 +399,11 @@ class DesktopMascot(QGraphicsView):
         def apply_offset(bone_name, offset):
             if bone_name in self.bones:
                 b = self.bones[bone_name]
-                b.setRotation(b.base_rotation + offset)
+                rotation = max(
+                    -b.rotation_limit,
+                    min(b.rotation_limit, b.base_rotation + offset),
+                )
+                b.setRotation(rotation)
                 b.update_subtree_transforms()
         
         apply_offset("Lhand", -lean - drop)
@@ -412,20 +440,30 @@ class DesktopMascot(QGraphicsView):
 class PuppetController(QObject):
     sig_rotate_bone = pyqtSignal(str, float)
     sig_set_expression = pyqtSignal(str, int)
+    sig_move_model_x = pyqtSignal(float, float)
 
     def __init__(self, mascot: DesktopMascot):
         super().__init__()
         self.mascot = mascot
         self.sig_rotate_bone.connect(self._handle_rotate_bone)
         self.sig_set_expression.connect(self._handle_set_expression)
+        self.sig_move_model_x.connect(self._handle_move_model_x)
+
+    def move_model_x(self, x_position, speed=300.0):
+        """Move the whole avatar to an absolute screen X position at pixels per second."""
+        self.sig_move_model_x.emit(float(x_position), float(speed))
 
     @pyqtSlot(str, float)
     def _handle_rotate_bone(self, bone_name, angle_deg):
         if bone_name in self.mascot.bones:
             bone = self.mascot.bones[bone_name]
             # Update base rotation so physics offsets play nicely with LLM commands
-            bone.base_rotation = angle_deg
-            bone.setRotation(angle_deg)
+            bone.base_rotation = max(
+                -bone.rotation_limit,
+                min(bone.rotation_limit, angle_deg),
+            )
+            bone.setRotation(bone.base_rotation)
+            bone.update_subtree_transforms()
 
     @pyqtSlot(str, int)
     def _handle_set_expression(self, bone_name, expr_index):
@@ -433,6 +471,11 @@ class PuppetController(QObject):
             bone = self.mascot.bones[bone_name]
             bone.data["expression_index"] = expr_index
             bone.apply_image_transform()
+
+    @pyqtSlot(float, float)
+    def _handle_move_model_x(self, x_position, speed):
+        physics = self.mascot.physics
+        physics.move_to_x(x_position, speed)
 
     def parse_llm_stream(self, text_chunk: str):
         for match in re.finditer(r"<rotate:([a-zA-Z0-9_]+)=([-\d.]+)>", text_chunk):
@@ -445,16 +488,70 @@ class PuppetController(QObject):
             idx = int(match.group(2))
             self.sig_set_expression.emit(bone_name, idx)
 
+        for match in re.finditer(r"<move:x=([-\d.]+)(?:,speed=([-\d.]+))?>", text_chunk):
+            speed = float(match.group(2)) if match.group(2) else 300.0
+            self.move_model_x(float(match.group(1)), speed)
+
+
+class ControllerCommandServer(threading.Thread):
+    """Accept newline-delimited controller commands from localhost clients."""
+
+    def __init__(self, controller, host="127.0.0.1", port=8765):
+        super().__init__(daemon=True)
+        self.controller = controller
+        self.host = host
+        self.port = port
+        self.stop_event = threading.Event()
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((host, port))
+        self.server_socket.listen()
+        self.server_socket.settimeout(0.5)
+
+    def run(self):
+        print(f"Controller command server listening on {self.host}:{self.port}")
+        while not self.stop_event.is_set():
+            try:
+                client, _ = self.server_socket.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self.stop_event.is_set():
+                    break
+                raise
+
+            with client:
+                client.settimeout(1.0)
+                data = b""
+                try:
+                    while not self.stop_event.is_set():
+                        chunk = client.recv(4096)
+                        if not chunk:
+                            break
+                        data += chunk
+                except socket.timeout:
+                    pass
+
+                for command in data.decode("utf-8", errors="ignore").splitlines():
+                    self.controller.parse_llm_stream(command)
+
+    def stop(self):
+        self.stop_event.set()
+        self.server_socket.close()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     
-    target_file = "assets/save3.json"
+    target_file = "assets/save4.json"
     if not os.path.exists(target_file):
         print(f"Error: {target_file} not found.")
         
     mascot = DesktopMascot(target_file)
     controller = PuppetController(mascot)
+    controller.parse_llm_stream("<expr:face=0>")
+    command_server = ControllerCommandServer(controller)
+    command_server.start()
     
     hotkey_listener = GlobalHotkeyListener()
     
@@ -462,6 +559,7 @@ if __name__ == "__main__":
     def quit_app():
         mascot.close()
         mascot.physics.running = False
+        command_server.stop()
         hotkey_listener.requestInterruption()
         if mascot.physics.isRunning():
             mascot.physics.wait()
