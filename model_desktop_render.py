@@ -34,7 +34,7 @@ LEAN_FACTOR = 0.03
 DROP_FACTOR = 0.02
 THROW_STRENGTH = 0.55
 MAX_THROW_SPEED_X = 1000.0
-MAX_THROW_SPEED_Y = 1000.0
+MAX_THROW_SPEED_Y = 1500.0
 PLATFORM_Y = None  # Set None to rely on window platforms & screen bottom
 
 
