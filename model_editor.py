@@ -233,16 +233,48 @@ class BoneNode(QGraphicsObject):
         self.image_paths.append(path)
         if len(self.image_paths) == 1:
             self.set_expression(0)
-            
+
+    def remove_expression(self, index):
+        """Remove a single expression by index from this bone.
+
+        If the list becomes empty, the bone is fully unattached (pixmap is
+        cleared and image_offset/image_rotation reset). Otherwise the
+        expression_index is clamped to a still-valid value."""
+        if not (0 <= index < len(self.image_paths)):
+            return False
+        del self.image_paths[index]
+        if not self.image_paths:
+            self.clear_images()
+            return True
+        # Clamp the index to a valid value and apply it
+        if self.expression_index >= len(self.image_paths):
+            self.expression_index = len(self.image_paths) - 1
+        self.set_expression(self.expression_index)
+        return True
+
+    def clear_images(self):
+        """Fully detach every PNG from this bone. The bone itself stays in
+        the hierarchy; only the image data and transform are reset."""
+        self.image_paths = []
+        self.expression_index = 0
+        self.pixmap_item.setPixmap(QPixmap())  # empty pixmap -> nothing drawn
+        self.image_offset = QPointF(0.0, 0.0)
+        self.image_rotation = 0.0
+        self.flip_h = False
+        self.flip_v = False
+        self.prepareGeometryChange()
+        # Re-sync transforms so the boundingRect/bone-local matrix clears too.
+        self.sync_pixmap()
+
     def set_expression(self, index):
         if 0 <= index < len(self.image_paths):
             self.expression_index = index
             pixmap = QPixmap(self.image_paths[index])
             self.pixmap_item.setPixmap(pixmap)
-            
+
             if index == 0 and len(self.image_paths) == 1:
                 self.image_offset = QPointF(-pixmap.width() / 2.0, -pixmap.height() / 2.0)
-            
+
             self.sync_pixmap()
 
     def set_flips(self, h, v):
@@ -394,6 +426,32 @@ class PuppetEditor(QMainWindow):
         btn_img = QPushButton("Add PNG / Expression")
         btn_img.clicked.connect(self.assign_image)
         prop_layout.addWidget(btn_img)
+
+        # Two image-removal options: granular (current expression) and nuke
+        # (all images). Both stay disabled when no bone is selected OR the
+        # bone has no images attached yet.
+        remove_layout = QHBoxLayout()
+        self.btn_remove_current = QPushButton("Remove Current Expression")
+        self.btn_remove_current.setToolTip(
+            "Remove the PNG currently being displayed on this bone.\n"
+            "If this is the only expression, the bone becomes fully unattached."
+        )
+        self.btn_remove_current.clicked.connect(self.remove_current_expression)
+        remove_layout.addWidget(self.btn_remove_current)
+
+        self.btn_unattach_all = QPushButton("Unattach All Images")
+        self.btn_unattach_all.setStyleSheet(
+            "QPushButton { background-color: #8b3a3a; border: 1px solid #5a2222; } "
+            "QPushButton:hover { background-color: #a84747; }"
+        )
+        self.btn_unattach_all.setToolTip(
+            "Detach every PNG from this bone. The bone itself is kept in the "
+            "skeleton, but all image paths, flips, and the pivot offset are cleared."
+        )
+        self.btn_unattach_all.clicked.connect(self.unattach_all_images)
+        remove_layout.addWidget(self.btn_unattach_all)
+
+        prop_layout.addLayout(remove_layout)
         
         expr_layout = QHBoxLayout()
         expr_layout.addWidget(QLabel("Expression Index:"))
@@ -688,12 +746,45 @@ class PuppetEditor(QMainWindow):
     def assign_image(self):
         selected = self.get_selected_node()
         if not selected: return
-        
+
         paths, _ = QFileDialog.getOpenFileNames(self, "Select PNG(s)", "", "Images (*.png)")
         if paths:
             for path in paths:
                 selected.add_image(path)
             self.sync_properties_ui()
+
+    def remove_current_expression(self):
+        """Remove only the currently-displayed PNG expression from the bone."""
+        selected = self.get_selected_node()
+        if not selected or not selected.image_paths:
+            return
+        idx = selected.expression_index
+        # Drop the visible expression and re-show whatever remains.
+        selected.remove_expression(idx)
+        self.scene.update()
+        self.sync_properties_ui()
+
+    def unattach_all_images(self):
+        """Detach every PNG from the selected bone. Confirmation required
+        because this is destructive (clears flips, pivot, base rotation)."""
+        selected = self.get_selected_node()
+        if not selected or not selected.image_paths:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Unattach all images?",
+            f"Detach ALL images from bone '{selected.name}'?\n\n"
+            f"This will remove {len(selected.image_paths)} expression(s) and "
+            "reset the image pivot, flips, and base rotation to defaults.\n"
+            "The bone itself is kept in the skeleton.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        selected.clear_images()
+        self.scene.update()
+        self.sync_properties_ui()
 
     def adjust_z(self, delta):
         selected = self.get_selected_node()
@@ -741,18 +832,24 @@ class PuppetEditor(QMainWindow):
 
     def sync_properties_ui(self):
         node = self.get_selected_node()
-        
+
         self.expr_spin.blockSignals(True)
         self.flip_h_cb.blockSignals(True)
         self.flip_v_cb.blockSignals(True)
         self.img_rot_spin.blockSignals(True)
-        
+
+        # Image-removal buttons are only meaningful when a bone is selected
+        # AND it has at least one image attached.
+        has_images = bool(node and node.image_paths)
+        self.btn_remove_current.setEnabled(has_images)
+        self.btn_unattach_all.setEnabled(has_images)
+
         if node:
-            self.expr_spin.setEnabled(True)
+            self.expr_spin.setEnabled(has_images)
             self.flip_h_cb.setEnabled(True)
             self.flip_v_cb.setEnabled(True)
             self.img_rot_spin.setEnabled(True)
-            
+
             max_idx = max(0, len(node.image_paths) - 1)
             self.expr_spin.setMaximum(max_idx)
             self.expr_spin.setValue(node.expression_index)
@@ -764,12 +861,12 @@ class PuppetEditor(QMainWindow):
             self.flip_h_cb.setEnabled(False)
             self.flip_v_cb.setEnabled(False)
             self.img_rot_spin.setEnabled(False)
-            
+
             self.expr_spin.setValue(0)
             self.flip_h_cb.setChecked(False)
             self.flip_v_cb.setChecked(False)
             self.img_rot_spin.setValue(0)
-            
+
         self.expr_spin.blockSignals(False)
         self.flip_h_cb.blockSignals(False)
         self.flip_v_cb.blockSignals(False)
