@@ -468,6 +468,9 @@ class TimelineWidget(QWidget):
         for i, kf in enumerate(self.keyframes):
             self._add_row_widget(i, kf)
         self.list_widget.blockSignals(False)
+        # Scroll to the bottom so the most recently loaded row is visible.
+        if self.list_widget.count() > 0:
+            self.list_widget.scrollToBottom()
         self._refresh_total_time()
 
     def add_keyframe(self, kf, select=False):
@@ -482,6 +485,12 @@ class TimelineWidget(QWidget):
         self._add_row_widget(idx, kf)
         if select:
             self._set_checked(idx)
+        # Scroll to the new row so the user always sees what they just
+        # captured. Without this, when the timeline overflows the viewport
+        # the user might add keyframe N and then be unable to see or click
+        # it because the list stays scrolled to the top.
+        if self.list_widget.count() > 0:
+            self.list_widget.scrollToBottom()
         self._refresh_total_time()
 
     def deselect(self):
@@ -744,6 +753,18 @@ class AnimationEditor(QMainWindow):
         # so editing after a play feels seamless.
         self.original_rotations = {}
 
+        # Rest-pose rotations: the "baseline" each bone is at when no
+        # animation is currently driving it. Populated on rig load.
+        # Reserved for future tooling (e.g. detecting when a bone hasn't
+        # actually been posed); dense keyframe capture does not depend on it.
+        self._rest_rotations = {}
+
+        # Set of bone names marked as "non-priority". Stored in the animation
+        # JSON so the runtime knows which bones defer to LLM stream commands
+        # instead of being driven by the keyframe animation. Right-click on
+        # any bone in the Skeleton Hierarchy tree to toggle.
+        self._non_priority_bones = set()
+
         # Path of the animation JSON the user currently has open (if any).
         # Lets "Save" behave like an overwrite of the same file.
         self.animation_source_path = None
@@ -807,6 +828,11 @@ class AnimationEditor(QMainWindow):
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Bones"])
         self.tree.itemSelectionChanged.connect(self.on_tree_selection)
+        # Right-click context menu: lets the user mark a bone as
+        # "non-priority", meaning the runtime defers to LLM stream commands
+        # for that bone instead of the keyframe animation.
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._show_bone_context_menu)
         hier_layout.addWidget(self.tree)
         hier_groupbox.setLayout(hier_layout)
         left_layout.addWidget(hier_groupbox)
@@ -979,8 +1005,16 @@ class AnimationEditor(QMainWindow):
         self.timeline = TimelineWidget()
         self.timeline.keyframeSelectionChanged = self._on_timeline_selection
         self.timeline.keyframeRecaptureRequested = self._recapture_keyframe_at
+        # Reserve a sensible minimum height so the timeline doesn't get
+        # squished when the user resizes the window. Without this, on a
+        # small window the canvas takes all the vertical space and the
+        # last row of the timeline can fall below the visible viewport.
+        self.timeline.setMinimumHeight(180)
         bottom_layout.addWidget(self.timeline)
 
+        # Same protection on the bottom panel: a small minimum so the
+        # timeline always has room to render its rows.
+        bottom_panel.setMinimumHeight(220)
         outer.addWidget(bottom_panel, 0)
 
         self.statusBar().showMessage(
@@ -1023,9 +1057,90 @@ class AnimationEditor(QMainWindow):
                 self.scene.clearSelection()
                 node.setSelected(True)
                 self.sync_properties_ui()
+                self._refresh_non_priority_indicator(name)
                 self.update_info_hud()
                 self.scene.blockSignals(False)
                 self.scene.update()
+
+    # ------------------------------------------------------------------
+    # Non-priority bone labelling
+    # ------------------------------------------------------------------
+    # Runtime contract (see model_desktop_render.py):
+    #   The animation JSON carries a `non_priority_bones` list. When the
+    #   runtime plays the animation, bones in this list still follow the
+    #   keyframe rotations UNLESS the LLM stream sends a `<rotate:NAME=ANGLE>`
+    #   command for that bone. In that case the LLM command wins until the
+    #   LLM stops issuing commands for the bone (or for a bounded timeout).
+    #   This lets you animate things like facial expressions on a schedule
+    #   while letting the LLM take control of the head at any time.
+    def _show_bone_context_menu(self, pos):
+        """Right-click handler on the Skeleton Hierarchy tree."""
+        item = self.tree.itemAt(pos)
+        if item is None:
+            return
+        name = item.text(0)
+        if name not in self.nodes:
+            return
+        # Promote the right-clicked item to selection so further UI syncs
+        # see the same bone the user is acting on.
+        self.tree.setCurrentItem(item)
+
+        from PyQt5.QtWidgets import QMenu
+        menu = QMenu(self.tree)
+        is_non_priority = name in self._non_priority_bones
+        toggle_action = menu.addAction(
+            "Mark as priority (animation-driven)"
+            if is_non_priority
+            else "Mark as non-priority (LLM can override)"
+        )
+        toggle_action.triggered.connect(
+            lambda checked=False, n=name: self._toggle_non_priority(n)
+        )
+        menu.exec_(self.tree.viewport().mapToGlobal(pos))
+
+    def _toggle_non_priority(self, bone_name):
+        if bone_name in self._non_priority_bones:
+            self._non_priority_bones.discard(bone_name)
+            self.statusBar().showMessage(
+                f"Bone '{bone_name}' is now priority (animation-driven)."
+            )
+        else:
+            self._non_priority_bones.add(bone_name)
+            self.statusBar().showMessage(
+                f"Bone '{bone_name}' is now non-priority "
+                "(runtime LLM commands will override the animation)."
+            )
+        # Refresh every indicator: tree label, properties panel, etc.
+        self._refresh_tree_indicators()
+        if self.get_selected_node() and self.get_selected_node().name == bone_name:
+            self._refresh_non_priority_indicator(bone_name)
+
+    def _refresh_tree_indicators(self):
+        """Update each tree row's text to reflect its non-priority state."""
+        for name, tree_item in self.tree_items.items():
+            if name in self._non_priority_bones:
+                # Marker in front of the name -- cheap, visible, no extra
+                # dependency on icon assets.
+                tree_item.setText(0, f"\u26A0  {name}")
+                tree_item.setToolTip(0, "Non-priority: runtime LLM commands override this bone's animation.")
+            else:
+                tree_item.setText(0, name)
+                tree_item.setToolTip(0, "")
+
+    def _refresh_non_priority_indicator(self, bone_name):
+        """Update the on-canvas HUD so the user sees the non-priority state
+        when a non-priority bone is selected."""
+        if bone_name in self._non_priority_bones:
+            node = self.nodes.get(bone_name)
+            if node:
+                text = (
+                    f"Bone: {node.name}  |  Local Pos: ({node.pos().x():.1f}, {node.pos().y():.1f})  "
+                    f"|  Rot: {node.rotation():.1f}\u00b0  |  Img Z: {node.image_z}  "
+                    "|  [NON-PRIORITY]"
+                )
+                self.hud_label.setText(text)
+                self.hud_label.adjustSize()
+                self.hud_label.show()
 
     def on_scene_selection(self):
         node = self.get_selected_node()
@@ -1115,19 +1230,29 @@ class AnimationEditor(QMainWindow):
         self.tree_items.clear()
         self.tree.clear()
         self.original_rotations.clear()
+        self._rest_rotations.clear()
+        self._non_priority_bones.clear()
         self.rig_source_path = None
         self.rig_name = None
         self.update_info_hud()
 
     def clear_animation(self):
-        """Wipe the timeline (keyframes + the animation file path). The rig
-        stays intact."""
-        if not self.timeline.keyframes:
+        """Wipe the timeline (keyframes + the animation file path) and any
+        non-priority bone labels, since those are part of the animation, not
+        the rig. The rig stays intact."""
+        has_keyframes = bool(self.timeline.keyframes)
+        has_labels = bool(self._non_priority_bones)
+        if not has_keyframes and not has_labels:
             return
+        what = []
+        if has_keyframes:
+            what.append(f"{len(self.timeline.keyframes)} keyframe(s)")
+        if has_labels:
+            what.append(f"{len(self._non_priority_bones)} non-priority bone label(s)")
         reply = QMessageBox.question(
             self,
             "Clear animation?",
-            f"Remove all {len(self.timeline.keyframes)} keyframes from the timeline?\n"
+            "Remove " + " and ".join(what) + " from this animation?\n"
             "This cannot be undone (use Save Animation JSON first if needed).",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -1137,6 +1262,11 @@ class AnimationEditor(QMainWindow):
         self.stop_playback(restore=True)
         self.timeline.clear()
         self.animation_source_path = None
+        # Non-priority bone labels are part of the animation, not the rig.
+        # Wipe them too so the saved file doesn't carry stale labels for a
+        # timeline that's about to disappear.
+        self._non_priority_bones.clear()
+        self._refresh_tree_indicators()
         self.statusBar().showMessage("Animation cleared.")
 
     def import_json(self):
@@ -1180,6 +1310,11 @@ class AnimationEditor(QMainWindow):
         self.tree_items.clear()
         self.tree.clear()
         self.original_rotations.clear()
+        self._rest_rotations.clear()
+        # Non-priority bone labels are tied to the rig identity -- start
+        # empty on a fresh rig load. Loading an animation JSON afterwards
+        # will populate them from that file's non_priority_bones field.
+        self._non_priority_bones.clear()
 
         bones_data = data.get("bones", {})
 
@@ -1237,6 +1372,13 @@ class AnimationEditor(QMainWindow):
         # Final resync pass (matches model_editor behavior)
         for node in self.nodes.values():
             node.sync_pixmap()
+
+        # Build the rest-pose baseline from the loaded rotation values. From
+        # here on, Capture Keyframe will only store bones whose current
+        # rotation differs from this baseline.
+        self._rest_rotations = {
+            name: node.rotation() for name, node in self.nodes.items()
+        }
 
         # Remember which rig this animation is targeting.
         self.rig_source_path = path
@@ -1312,9 +1454,27 @@ class AnimationEditor(QMainWindow):
                 )
 
         self.timeline.rebuild(loaded_keyframes)
+
+        # Load non-priority bone labels (intersected with the loaded rig so
+        # we don't carry labels for bones that don't exist on the current rig).
+        raw_np = data.get("non_priority_bones", []) if isinstance(data, dict) else []
+        if not isinstance(raw_np, list):
+            raw_np = []
+        if self.nodes:
+            self._non_priority_bones = {
+                name for name in raw_np if name in self.nodes
+            }
+        else:
+            # No rig loaded yet: keep the raw list -- we'll intersect again
+            # when the rig is loaded.
+            self._non_priority_bones = set(raw_np)
+        self._refresh_tree_indicators()
+
         self.animation_source_path = path
+        np_count = len(self._non_priority_bones)
         self.statusBar().showMessage(
-            f"Loaded animation: {path}  ({len(loaded_keyframes)} keyframes)"
+            f"Loaded animation: {path}  ({len(loaded_keyframes)} keyframes, "
+            f"{np_count} non-priority bone(s))"
         )
 
     def export_animation_json(self):
@@ -1347,30 +1507,69 @@ class AnimationEditor(QMainWindow):
 
     def _write_animation_file(self, path):
         """Internal helper: serialize the timeline + rig pointer to disk."""
+        # Only persist non-priority labels for bones that still exist on the
+        # loaded rig -- otherwise the file would carry stale names that the
+        # runtime can't resolve.
+        rig_bone_names = set(self.nodes.keys())
+        non_priority = sorted(
+            name for name in self._non_priority_bones if name in rig_bone_names
+        )
         data = {
             "format": "lumi_avatar_animation",
             "version": 1,
             "rig_name": self.rig_name,
             "rig_source_path": self.rig_source_path,
+            "non_priority_bones": non_priority,
             "keyframes": [kf.to_dict() for kf in self.timeline.keyframes],
         }
         with open(path, 'w') as f:
             json.dump(data, f, indent=4)
         self.animation_source_path = path
         self.statusBar().showMessage(
-            f"Saved animation: {path}  ({len(self.timeline.keyframes)} keyframes)"
+            f"Saved animation: {path}  ({len(self.timeline.keyframes)} keyframes, "
+            f"{len(non_priority)} non-priority bone(s))"
         )
 
     # ------------------------------------------------------------------
     # Keyframe capture
     # ------------------------------------------------------------------
+    # Threshold (in degrees) below which a rotation difference is treated as
+    # "no change" for sparse keyframe capture. A tiny epsilon avoids noise
+    # from float rounding after multiple round-trips through setRotation.
+    # Currently unused for capture (keyframes are dense now) but kept as a
+    # utility for any future feature that wants to compare against the rest
+    # baseline.
+    _ROTATION_EPSILON = 0.005
+
+    def _all_current_rotations(self):
+        """Snapshot EVERY bone's current rotation. Keyframes are dense: even
+        bones that haven't moved get stored, so playback can always interpolate
+        any bone without consulting the rest baseline."""
+        return {name: node.rotation() for name, node in self.nodes.items()}
+
+    def _apply_rotations(self, rotations):
+        """Set each listed bone's rotation from a {bone_name: rot} dict.
+
+        Unlisted bones are NOT touched -- this is useful when partially
+        restoring a snapshot during playback (a bone that wasn't part of a
+        transition keeps whatever rotation it had from the previous segment)."""
+        for name, rot in rotations.items():
+            node = self.nodes.get(name)
+            if node is None:
+                continue
+            rot_clamped = max(-node.rotation_limit, min(node.rotation_limit, rot))
+            node.setRotation(rot_clamped)
+            node.sync_subtree_pixmaps()
+
     def capture_keyframe(self):
         if not self.nodes:
             QMessageBox.information(self, "No rig", "Load a rig first.")
             return
 
-        # Snapshot every bone's current rotation.
-        rotations = {name: node.rotation() for name, node in self.nodes.items()}
+        # Dense snapshot: every bone's rotation is stored, even if it didn't
+        # move. This keeps playback simple and the JSON file explicit about
+        # what every frame looks like.
+        rotations = self._all_current_rotations()
 
         sel = self.timeline.selected_index()
         if sel is None or sel < 0:
@@ -1386,28 +1585,33 @@ class AnimationEditor(QMainWindow):
             self.timeline.add_keyframe(kf, select=False)
             self.statusBar().showMessage(
                 f"Captured keyframe #{len(self.timeline.keyframes)} "
-                "(pose continues from here -- capture again for keyframe 2, "
-                "right-click a row to overwrite)"
+                f"({len(rotations)} bone(s)). Pose continues from here -- "
+                "capture again for the next keyframe."
             )
         else:
             # A row is selected => treat Capture as an explicit overwrite.
             existing = self.timeline.keyframes[sel]
-            existing.rotations = rotations
+            existing.rotations = dict(rotations)
             self.timeline.update_keyframe(sel, existing)
-            self.statusBar().showMessage(f"Updated keyframe #{sel + 1}")
+            self.statusBar().showMessage(
+                f"Updated keyframe #{sel + 1} ({len(rotations)} bone(s))"
+            )
 
     def _recapture_keyframe_at(self, row):
-        """Triggered by right-click 'Recapture this keyframe'. Snaps the
-        current pose into the chosen keyframe, regardless of selection state."""
+        """Triggered by right-click 'Recapture this keyframe'. Replaces
+        the keyframe's rotations with a fresh dense snapshot of the current
+        pose, preserving the keyframe's interval and easing."""
         if not self.nodes:
             return
         if not (0 <= row < len(self.timeline.keyframes)):
             return
-        rotations = {name: node.rotation() for name, node in self.nodes.items()}
+        rotations = self._all_current_rotations()
         existing = self.timeline.keyframes[row]
-        existing.rotations = rotations
+        existing.rotations = dict(rotations)
         self.timeline.update_keyframe(row, existing)
-        self.statusBar().showMessage(f"Re-captured keyframe #{row + 1}")
+        self.statusBar().showMessage(
+            f"Re-captured keyframe #{row + 1} ({len(rotations)} bone(s))"
+        )
 
     def _on_timeline_selection(self, row):
         # Selecting a keyframe in the timeline can do one of two things:
@@ -1458,7 +1662,11 @@ class AnimationEditor(QMainWindow):
             "font-weight: bold; padding: 6px 14px; background-color: #ef6c00; "
             "border: 1px solid #b04a00;"
         )
-        # Start at the first keyframe's pose immediately
+        # Seed every bone to its rest baseline first -- keyframes store
+        # SPARSE rotations, so the only way keyframe 0's pose is well-defined
+        # is if unmentioned bones start from rest.
+        self._apply_rotations(self._rest_rotations)
+        # Now layer keyframe 0 on top of that.
         self._apply_keyframe_pose(self.timeline.keyframes[0])
         self._play_index = 1  # we're interpolating TOWARDS keyframes[_play_index]
         self._play_start_time_ms = self._now_ms()
@@ -1503,9 +1711,9 @@ class AnimationEditor(QMainWindow):
         eased_t = apply_easing(t, target_kf.easing)
 
         # Interpolate every bone that exists in either snapshot. If a bone
-        # wasn't in one of the snapshots, hold its current pose for that
-        # segment -- that's the most intuitive behavior when bones are added
-        # between captures.
+        # wasn't in one of the snapshots, fall back to its rest-pose baseline
+        # so unposed bones stay at rest (rather than drifting to whatever
+        # value the previous tick happened to write).
         all_bones = set(source_kf.rotations.keys()) | set(target_kf.rotations.keys())
         all_bones |= set(self.nodes.keys())
 
@@ -1513,8 +1721,9 @@ class AnimationEditor(QMainWindow):
             node = self.nodes.get(bone_name)
             if not node:
                 continue
-            src = source_kf.rotations.get(bone_name, node.rotation())
-            tgt = target_kf.rotations.get(bone_name, node.rotation())
+            rest = self._rest_rotations.get(bone_name, node.rotation())
+            src = source_kf.rotations.get(bone_name, rest)
+            tgt = target_kf.rotations.get(bone_name, rest)
             new_rot = src + (tgt - src) * eased_t
             # Respect each bone's rotation_limit just like dragging does.
             new_rot = max(-node.rotation_limit, min(node.rotation_limit, new_rot))
