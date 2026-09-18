@@ -8,14 +8,22 @@ import time
 import ctypes
 from ctypes import wintypes
 
-from PyQt6.QtWidgets import QApplication, QGraphicsView, QGraphicsScene, QGraphicsObject, QGraphicsPixmapItem
-from PyQt6.QtCore import Qt, QRectF, QObject, pyqtSignal, pyqtSlot, QThread
-from PyQt6.QtGui import QImage, QPixmap, QTransform, QScreen
+from PyQt6.QtWidgets import QApplication, QGraphicsView, QGraphicsScene, QGraphicsObject, QGraphicsPixmapItem, QWidget
+from PyQt6.QtCore import Qt, QRectF, QObject, pyqtSignal, pyqtSlot, QThread, QTimer
+from PyQt6.QtGui import QImage, QPixmap, QTransform, QScreen, QPainter, QPen, QColor
+
+from winPlatforms import WindowPlatformDetector
+
+if sys.platform == "win32":
+    user32 = ctypes.windll.user32
+else:
+    user32 = None
 
 
 # --- Easy tuning variables ---
+DEBUG = False  # Set to True to show window borders, platform surfaces, and model bounding box
 MODEL_SCALE = 0.15
-MODEL_PADDING = 24
+MODEL_PADDING = 0
 PHYSICS_FPS = 60
 GRAVITY = 2800.0
 FRICTION = 0.65
@@ -27,7 +35,118 @@ DROP_FACTOR = 0.02
 THROW_STRENGTH = 0.55
 MAX_THROW_SPEED_X = 1000.0
 MAX_THROW_SPEED_Y = 1000.0
-PLATFORM_Y = 560  # Set a screen Y coordinate, or use None for the screen bottom.
+PLATFORM_Y = None  # Set None to rely on window platforms & screen bottom
+
+
+class DebugOverlay(QWidget):
+    """
+    Full-screen transparent overlay active when DEBUG = True.
+    Displays:
+    - Green bounding boxes around detected top-level windows
+    - Red lines for usable window platform surfaces (top/bottom edges)
+    - Cyan bounding box around the Lumi mascot on screen
+    Handles DPI scaling (e.g., 125% zoom) cleanly.
+    """
+    def __init__(self, window_detector, mascot):
+        super().__init__()
+        self.window_detector = window_detector
+        self.mascot = mascot
+
+        self.setWindowTitle("Lumi Platform & Model Debug Overlay")
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowTransparentForInput
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+
+        self.timer = QTimer(self)
+        self.timer.setInterval(33)  # ~30 FPS debug overlay refresh rate
+        self.timer.timeout.connect(self.update_overlay)
+        self.timer.start()
+
+        self.refresh_geometry()
+        self.show()
+
+    def refresh_geometry(self):
+        screens = QApplication.screens()
+        if not screens:
+            return
+        left = min(s.geometry().left() for s in screens)
+        top = min(s.geometry().top() for s in screens)
+        right = max(s.geometry().right() for s in screens)
+        bottom = max(s.geometry().bottom() for s in screens)
+
+        self.qt_x = left
+        self.qt_y = top
+        self.setGeometry(left, top, right - left + 1, bottom - top + 1)
+
+    def update_overlay(self):
+        self.refresh_geometry()
+        self.update()
+
+    def physical_to_qt(self, x, y, hwnd):
+        """Converts Windows physical pixel coordinates to Qt logical coordinates."""
+        if sys.platform == "win32" and hwnd and user32:
+            try:
+                dpi = user32.GetDpiForWindow(hwnd)
+                scale = (dpi / 96.0) if dpi else 1.0
+            except Exception:
+                scale = 1.0
+        else:
+            scale = 1.0
+        return (round(x / scale), round(y / scale))
+
+    def paintEvent(self, event):
+        if not DEBUG:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+
+        # 1. Detected Window Bounding Boxes (Green)
+        green_pen = QPen(QColor(0, 220, 0), 2)
+        painter.setPen(green_pen)
+
+        windows = getattr(self.window_detector, "windows", [])
+        for window in windows:
+            x1, y1 = self.physical_to_qt(window.left, window.top, window.hwnd)
+            x2, y2 = self.physical_to_qt(window.right, window.bottom, window.hwnd)
+
+            rx1 = x1 - self.qt_x
+            ry1 = y1 - self.qt_y
+            rw = x2 - x1
+            rh = y2 - y1
+            painter.drawRect(rx1, ry1, rw, rh)
+
+        # 2. Window Surface Platforms (Red)
+        red_pen = QPen(QColor(255, 50, 50), 3)
+        painter.setPen(red_pen)
+
+        platforms = getattr(self.window_detector, "platforms", [])
+        for platform in platforms:
+            x1, y1 = self.physical_to_qt(platform.x1, platform.y, platform.hwnd)
+            x2, y2 = self.physical_to_qt(platform.x2, platform.y, platform.hwnd)
+
+            rx1 = x1 - self.qt_x
+            ry1 = y1 - self.qt_y
+            rx2 = x2 - self.qt_x
+            ry2 = y2 - self.qt_y
+            painter.drawLine(rx1, ry1, rx2, ry2)
+
+        # 3. Model Mascot Bounding Box on Screen (Cyan)
+        if self.mascot:
+            cyan_pen = QPen(QColor(0, 255, 255), 2, Qt.PenStyle.DashLine)
+            painter.setPen(cyan_pen)
+            m_geom = self.mascot.geometry()
+            mx = m_geom.x() - self.qt_x
+            my = m_geom.y() - self.qt_y
+            painter.drawRect(mx, my, m_geom.width(), m_geom.height())
+
+        painter.end()
 
 
 class ImageAssetCache:
@@ -118,6 +237,7 @@ class ImageAssetCache:
         self.assets[path] = asset
         return asset
 
+
 class GlobalHotkeyListener(QThread):
     f9_pressed = pyqtSignal()
 
@@ -126,39 +246,43 @@ class GlobalHotkeyListener(QThread):
             print("Warning: Global F9 hotkey is only supported on Windows.")
             return
 
-        user32 = ctypes.windll.user32
+        user32_dll = ctypes.windll.user32
         HOTKEY_ID = 1
         VK_F9 = 0x78          
         MOD_NOREPEAT = 0x4000  
         WM_HOTKEY = 0x0312
 
-        if not user32.RegisterHotKey(None, HOTKEY_ID, MOD_NOREPEAT, VK_F9):
+        if not user32_dll.RegisterHotKey(None, HOTKEY_ID, MOD_NOREPEAT, VK_F9):
             print("Warning: Could not register global F9 hotkey.")
             return
 
         msg = wintypes.MSG()
         try:
-            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+            while user32_dll.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
                 if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
                     self.f9_pressed.emit()
                     break
-                user32.TranslateMessage(ctypes.byref(msg))
-                user32.DispatchMessageW(ctypes.byref(msg))
+                user32_dll.TranslateMessage(ctypes.byref(msg))
+                user32_dll.DispatchMessageW(ctypes.byref(msg))
         finally:
-            user32.UnregisterHotKey(None, HOTKEY_ID)
+            user32_dll.UnregisterHotKey(None, HOTKEY_ID)
 
 
 class PhysicsThread(QThread):
     """
     Dedicated background thread for lagless physics calculations.
     Maintains a consistent 60 FPS tick independent of the main GUI thread.
+    Handles dynamic window platform detection and collisions.
     """
     physics_tick = pyqtSignal(int, int, float, float)
 
-    def __init__(self, screen_w, screen_h):
+    def __init__(self, screen_w, screen_h, mascot_w=100, mascot_h=100, window_detector=None):
         super().__init__()
         self.screen_w = screen_w
         self.screen_h = screen_h
+        self.mascot_w = mascot_w
+        self.mascot_h = mascot_h
+        self.window_detector = window_detector
         self.floor_y = screen_h if PLATFORM_Y is None else PLATFORM_Y
         self.x, self.y = 0.0, 0.0
         self.vx, self.vy = 0.0, 0.0
@@ -175,7 +299,6 @@ class PhysicsThread(QThread):
         self.last_time = time.time()
 
     def sync_drag(self, x, y):
-        # Calculate velocity based on drag distance for natural tossing momentum
         now = time.time()
         delta = max(now - self.last_time, 0.001)
         raw_vx = (x - self.x) / delta
@@ -198,8 +321,12 @@ class PhysicsThread(QThread):
             delta = now - self.last_time
             self.last_time = now
 
+            if self.window_detector:
+                self.window_detector.update()
+
             if not self.is_dragging:
-                # Apply gravity and velocity
+                prev_x, prev_y = self.x, self.y
+
                 self.vy += self.gravity * delta
 
                 if self.target_x is not None:
@@ -216,15 +343,54 @@ class PhysicsThread(QThread):
                     self.x += self.vx * delta
                 
                 self.y += self.vy * delta
-                
-                # Floor collision logic
-                if self.y >= self.floor_y:
+
+                # --- Platform Collisions ---
+                landed_on_platform = False
+                if self.window_detector:
+                    platform_tuples = self.window_detector.get_platform_tuples()
+                    lumi_w = self.mascot_w
+                    lumi_h = self.mascot_h
+                    
+                    lumi_x1 = self.x
+                    lumi_x2 = self.x + lumi_w
+                    lumi_bottom = self.y + lumi_h
+                    prev_bottom = prev_y + lumi_h
+
+                    for x1, x2, y, side, hwnd in platform_tuples:
+                        scale = 1.0
+                        if sys.platform == "win32" and hwnd and user32:
+                            try:
+                                dpi = user32.GetDpiForWindow(hwnd)
+                                if dpi:
+                                    scale = dpi / 96.0
+                            except Exception:
+                                pass
+                        
+                        lx1 = x1 / scale
+                        lx2 = x2 / scale
+                        ly = y / scale
+
+                        # Horizontal overlap check
+                        if lumi_x2 > lx1 and lumi_x1 < lx2:
+                            # Allow standing on both top and bottom window borders
+                            if side in ("top", "bottom"):
+                                if self.vy >= 0 and prev_bottom <= ly + 10 and lumi_bottom >= ly - 6:
+                                    self.y = ly - lumi_h
+                                    self.vy *= self.bounce
+                                    self.vx *= self.friction
+                                    if abs(self.vy) < 25: self.vy = 0.0
+                                    if abs(self.vx) < 25: self.vx = 0.0
+                                    landed_on_platform = True
+                                    break
+
+                # Floor collision logic (Fallback if not landed on a platform)
+                if not landed_on_platform and self.y >= self.floor_y:
                     self.y = self.floor_y
                     self.vy *= self.bounce
                     self.vx *= self.friction
                     
-                    if abs(self.vy) < 25: self.vy = 0
-                    if abs(self.vx) < 25: self.vx = 0
+                    if abs(self.vy) < 25: self.vy = 0.0
+                    if abs(self.vx) < 25: self.vx = 0.0
 
                 # Screen bounds (Walls)
                 if self.x <= 0:
@@ -234,7 +400,6 @@ class PhysicsThread(QThread):
                     self.x = self.screen_w
                     self.vx *= self.bounce
 
-            # Emit state to GUI for transform and kinematic dangling updates
             self.physics_tick.emit(int(self.x), int(self.y), self.vx, self.vy)
             
             elapsed = time.time() - now
@@ -316,7 +481,6 @@ class DesktopMascot(QGraphicsView):
             os.path.join(os.path.dirname(os.path.abspath(json_path)), ".image_bounds.json")
         )
         
-        # NOTE: Removed WA_TransparentForMouseEvents so mouse dragging functions
         flags = (
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.WindowStaysOnTopHint |
@@ -338,15 +502,30 @@ class DesktopMascot(QGraphicsView):
         self.bones = {}
         self.load_rig(json_path)
 
-        # Initialize Physics after rig bounds are calculated
+        self.window_detector = WindowPlatformDetector(poll_interval=0.10)
+
         screen = QApplication.primaryScreen().availableGeometry()
         self.physics = PhysicsThread(
-            screen.width() - self.width(), screen.height() - self.height()
+            screen.width() - self.width(),
+            screen.height() - self.height(),
+            mascot_w=self.width(),
+            mascot_h=self.height(),
+            window_detector=self.window_detector
         )
         self.physics.x = screen.left()
         self.physics.y = screen.top()
         self.physics.physics_tick.connect(self._physics_process)
         self.physics.start()
+
+    def drawForeground(self, painter, rect):
+        super().drawForeground(painter, rect)
+        if DEBUG:
+            painter.save()
+            pen = QPen(QColor(0, 255, 255, 200), 2, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(self.sceneRect())
+            painter.restore()
 
     def load_rig(self, path):
         try:
@@ -388,11 +567,9 @@ class DesktopMascot(QGraphicsView):
 
     @pyqtSlot(int, int, float, float)
     def _physics_process(self, x, y, vx, vy):
-        # Let the UI instantly follow the mouse if dragging; otherwise, use physics target
         if not self.physics.is_dragging:
             self.move(x, y)
         
-        # Ragdoll kinematic adjustments mapping velocity vectors to limb rotations
         lean = max(-MAX_LEAN, min(MAX_LEAN, vx * LEAN_FACTOR))
         drop = max(-MAX_DROP, min(MAX_DROP, vy * DROP_FACTOR))
         
@@ -413,7 +590,6 @@ class DesktopMascot(QGraphicsView):
         apply_offset("hairBack", lean * 0.5)
         apply_offset("hairFront", lean * 0.7)
 
-    # --- Mouse Events for Dragging ---
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
@@ -450,14 +626,12 @@ class PuppetController(QObject):
         self.sig_move_model_x.connect(self._handle_move_model_x)
 
     def move_model_x(self, x_position, speed=300.0):
-        """Move the whole avatar to an absolute screen X position at pixels per second."""
         self.sig_move_model_x.emit(float(x_position), float(speed))
 
     @pyqtSlot(str, float)
     def _handle_rotate_bone(self, bone_name, angle_deg):
         if bone_name in self.mascot.bones:
             bone = self.mascot.bones[bone_name]
-            # Update base rotation so physics offsets play nicely with LLM commands
             bone.base_rotation = max(
                 -bone.rotation_limit,
                 min(bone.rotation_limit, angle_deg),
@@ -494,7 +668,6 @@ class PuppetController(QObject):
 
 
 class ControllerCommandServer(threading.Thread):
-    """Accept newline-delimited controller commands from localhost clients."""
 
     def __init__(self, controller, host="127.0.0.1", port=8765):
         super().__init__(daemon=True)
@@ -553,10 +726,15 @@ if __name__ == "__main__":
     command_server = ControllerCommandServer(controller)
     command_server.start()
     
+    debug_overlay = None
+    if DEBUG:
+        debug_overlay = DebugOverlay(mascot.window_detector, mascot)
+    
     hotkey_listener = GlobalHotkeyListener()
     
-    # Gracefully shut down threads on exit
     def quit_app():
+        if debug_overlay:
+            debug_overlay.close()
         mascot.close()
         mascot.physics.running = False
         command_server.stop()
