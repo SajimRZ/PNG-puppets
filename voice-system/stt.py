@@ -24,7 +24,7 @@ CHAT_HOST = "127.0.0.1"
 CHAT_PORT = 8765
 
 # ---- tweak these if you like -------------------------------------------------
-MAIN_MODEL = "small.en"      # accurate model for final text (tiny.en / base.en / medium.en)
+MAIN_MODEL = "base.en"      # accurate model for final text (tiny.en / base.en / medium.en)
 LIVE_MODEL = "tiny.en"       # fast model for the live partial text
 ENABLE_PARTIAL_TRANSCRIPTION = False
 USE_MAIN_MODEL_FOR_PARTIALS = False

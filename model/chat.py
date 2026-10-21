@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import queue
 import socket
@@ -29,6 +30,8 @@ IM_START = "<|im_start|>"
 IM_END = "<|im_end|>"
 VOICE_HOST = "127.0.0.1"
 VOICE_PORT = 8765
+LLM_LISTEN_HOST = "127.0.0.1"
+LLM_LISTEN_PORT = 8766
 
 
 parser = argparse.ArgumentParser(
@@ -93,7 +96,65 @@ parser.add_argument(
     default=-1,
     help="Sampling seed. -1 lets the backend choose a seed.",
 )
+parser.add_argument(
+    "--llm-host",
+    default=LLM_LISTEN_HOST,
+    help="Renderer host for streamed assistant text.",
+)
+parser.add_argument(
+    "--llm-port",
+    type=int,
+    default=LLM_LISTEN_PORT,
+    help="Renderer port for streamed assistant text.",
+)
 args = parser.parse_args()
+
+
+class LLMStreamClient:
+    """Send streamed assistant text to the optional avatar renderer."""
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self.connection = None
+        self.warned = False
+
+    def connect(self) -> bool:
+        try:
+            self.connection = socket.create_connection(
+                (self.host, self.port),
+                timeout=0.2,
+            )
+            self.connection.settimeout(None)
+            return True
+        except OSError as error:
+            if not self.warned:
+                print(
+                    f"[LLM] Renderer unavailable at {self.host}:{self.port}: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self.warned = True
+            self.connection = None
+            return False
+
+    def send(self, message_type: str, text: str = "") -> None:
+        if self.connection is None:
+            return
+        payload = json.dumps({"type": message_type, "text": text}, ensure_ascii=False)
+        try:
+            self.connection.sendall((payload + "\n").encode("utf-8"))
+        except OSError as error:
+            print(f"[LLM] Renderer connection lost: {error}", file=sys.stderr, flush=True)
+            self.close()
+
+    def close(self) -> None:
+        if self.connection is not None:
+            try:
+                self.connection.close()
+            except OSError:
+                pass
+            self.connection = None
 
 
 def format_messages(messages: List[Dict[str, str]], add_generation_prompt: bool = True) -> str:
@@ -217,11 +278,15 @@ def process_input(
 
     print("Assistant: ", end="", flush=True)
     assistant_reply = ""
+    llm_client = LLMStreamClient(args.llm_host, args.llm_port)
+    llm_client.connect()
+    llm_client.send("start")
 
     try:
         for chunk in stream_chat_reply(history):
             print(chunk, end="", flush=True)
             assistant_reply += chunk
+            llm_client.send("chunk", chunk)
     except KeyboardInterrupt:
         print("\n[Generation interrupted]")
         # Keep only generated text if any; the next prompt remains usable.
@@ -231,9 +296,13 @@ def process_input(
         # leave history ending with two consecutive user messages.
         if history and history[-1]["role"] == "user":
             history.pop()
+        llm_client.send("end")
+        llm_client.close()
         return history, True
 
     print()
+    llm_client.send("end")
+    llm_client.close()
     assistant_reply = assistant_reply.strip()
     if assistant_reply:
         history.append({"role": "assistant", "content": assistant_reply})

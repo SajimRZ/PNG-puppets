@@ -227,6 +227,23 @@ streams each response directly to the terminal:
 python model/chat.py
 ```
 
+When `model_desktop_render.py` is running, chat also streams every generated
+response to its local LLM listener. The renderer listens on
+`127.0.0.1:8766` by default and displays the response as a subtitle over the
+avatar while it is generated. The stream is optional: chat continues normally
+if the renderer is not running. Override the endpoint with:
+
+```powershell
+python model/chat.py --llm-host 127.0.0.1 --llm-port 8766
+```
+
+Start the renderer before chat if you want subtitles:
+
+```powershell
+python model_desktop_render.py
+python model/chat.py
+```
+
 The defaults can be edited at the top of `model/chat.py`. Common generation
 settings are also available as command-line options:
 

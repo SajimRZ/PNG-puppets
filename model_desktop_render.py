@@ -8,9 +8,26 @@ import time
 import ctypes
 from ctypes import wintypes
 
-from PyQt6.QtWidgets import QApplication, QGraphicsView, QGraphicsScene, QGraphicsObject, QGraphicsPixmapItem, QWidget
+from PyQt6.QtWidgets import (
+    QApplication,
+    QGraphicsView,
+    QGraphicsScene,
+    QGraphicsObject,
+    QGraphicsPixmapItem,
+    QLabel,
+    QWidget,
+)
 from PyQt6.QtCore import Qt, QRectF, QObject, pyqtSignal, pyqtSlot, QThread, QTimer
-from PyQt6.QtGui import QImage, QPixmap, QTransform, QScreen, QPainter, QPen, QColor
+from PyQt6.QtGui import (
+    QImage,
+    QPixmap,
+    QTransform,
+    QScreen,
+    QPainter,
+    QPen,
+    QColor,
+    QFont,
+)
 
 from winPlatforms import WindowPlatformDetector
 
@@ -36,6 +53,21 @@ THROW_STRENGTH = 0.55
 MAX_THROW_SPEED_X = 1000.0
 MAX_THROW_SPEED_Y = 1500.0
 PLATFORM_Y = None  # Set None to rely on window platforms & screen bottom
+LLM_LISTEN_HOST = "127.0.0.1"
+LLM_LISTEN_PORT = 8766
+
+# --- Subtitle appearance -----------------------------------------------------
+SUBTITLE_FONT_FAMILY = "Segoe UI"
+SUBTITLE_FONT_SIZE = 16
+SUBTITLE_FONT_BOLD = False
+SUBTITLE_FONT_ITALIC = False
+SUBTITLE_FONT_UNDERLINE = False
+SUBTITLE_TEXT_COLOR = QColor(255, 255, 255, 255)
+SUBTITLE_WIDTH = 720
+SUBTITLE_PADDING = 8
+SUBTITLE_ALIGNMENT = Qt.AlignmentFlag.AlignCenter
+SUBTITLE_OFFSET = 18
+# ------------------------------------------------------------------------------
 
 
 class DebugOverlay(QWidget):
@@ -236,6 +268,66 @@ class ImageAssetCache:
         asset = (pixmap, (width, height), tuple(bbox))
         self.assets[path] = asset
         return asset
+
+
+class SubtitleWindow(QWidget):
+    """Independent transparent subtitle window that does not affect physics."""
+
+    def __init__(self, mascot):
+        super().__init__()
+        self.mascot = mascot
+        self.label = QLabel(self)
+        self.label.setWordWrap(True)
+        self.label.setAlignment(SUBTITLE_ALIGNMENT)
+        self.label.setStyleSheet(
+            "QLabel { "
+            f"color: {SUBTITLE_TEXT_COLOR.name(QColor.NameFormat.HexArgb)}; "
+            "background: transparent; "
+            f"padding: {SUBTITLE_PADDING}px; "
+            "}"
+        )
+        font = QFont(SUBTITLE_FONT_FAMILY, SUBTITLE_FONT_SIZE)
+        font.setBold(SUBTITLE_FONT_BOLD)
+        font.setItalic(SUBTITLE_FONT_ITALIC)
+        font.setUnderline(SUBTITLE_FONT_UNDERLINE)
+        self.label.setFont(font)
+
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowTransparentForInput
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setFixedWidth(SUBTITLE_WIDTH)
+        self.hide()
+
+    def set_text(self, text):
+        if not text:
+            self.hide()
+            return
+
+        self.label.setText(text)
+        self.label.setFixedWidth(self.width())
+        self.label.setGeometry(0, 0, self.width(), self.label.sizeHint().height())
+        self.resize(self.width(), self.label.height())
+        self._move_near_mascot()
+        self.show()
+
+    def _move_near_mascot(self):
+        mascot_rect = self.mascot.frameGeometry()
+        x = mascot_rect.center().x() - (self.width() // 2)
+        y = mascot_rect.top() - self.height() - SUBTITLE_OFFSET
+        if y < 0:
+            y = mascot_rect.bottom() + SUBTITLE_OFFSET
+        self.move(x, y)
+
+    def follow_mascot(self):
+        if self.isVisible():
+            self._move_near_mascot()
 
 
 class GlobalHotkeyListener(QThread):
@@ -477,6 +569,7 @@ class DesktopMascot(QGraphicsView):
     def __init__(self, json_path, scale_factor=MODEL_SCALE):
         super().__init__()
         self.scale_factor = scale_factor
+        self.subtitle_window = None
         self.asset_cache = ImageAssetCache(
             os.path.join(os.path.dirname(os.path.abspath(json_path)), ".image_bounds.json")
         )
@@ -527,6 +620,9 @@ class DesktopMascot(QGraphicsView):
             painter.drawRect(self.sceneRect())
             painter.restore()
 
+    def set_subtitle_window(self, subtitle_window):
+        self.subtitle_window = subtitle_window
+
     def load_rig(self, path):
         try:
             with open(path, 'r') as f:
@@ -569,6 +665,8 @@ class DesktopMascot(QGraphicsView):
     def _physics_process(self, x, y, vx, vy):
         if not self.physics.is_dragging:
             self.move(x, y)
+        if self.subtitle_window:
+            self.subtitle_window.follow_mascot()
         
         lean = max(-MAX_LEAN, min(MAX_LEAN, vx * LEAN_FACTOR))
         drop = max(-MAX_DROP, min(MAX_DROP, vy * DROP_FACTOR))
@@ -617,13 +715,18 @@ class PuppetController(QObject):
     sig_rotate_bone = pyqtSignal(str, float)
     sig_set_expression = pyqtSignal(str, int)
     sig_move_model_x = pyqtSignal(float, float)
+    sig_set_subtitle = pyqtSignal(str)
 
-    def __init__(self, mascot: DesktopMascot):
+    def __init__(self, mascot: DesktopMascot, subtitle_window):
         super().__init__()
         self.mascot = mascot
+        self.subtitle_window = subtitle_window
+        self.subtitle_text = ""
+        self._stream_buffer = ""
         self.sig_rotate_bone.connect(self._handle_rotate_bone)
         self.sig_set_expression.connect(self._handle_set_expression)
         self.sig_move_model_x.connect(self._handle_move_model_x)
+        self.sig_set_subtitle.connect(self._handle_set_subtitle)
 
     def move_model_x(self, x_position, speed=300.0):
         self.sig_move_model_x.emit(float(x_position), float(speed))
@@ -651,20 +754,53 @@ class PuppetController(QObject):
         physics = self.mascot.physics
         physics.move_to_x(x_position, speed)
 
+    @pyqtSlot(str)
+    def _handle_set_subtitle(self, text):
+        self.subtitle_window.set_text(text)
+
+    def parse_llm_message(self, message):
+        message_type = message.get("type")
+        if message_type == "start":
+            self.subtitle_text = ""
+            self._stream_buffer = ""
+            self.sig_set_subtitle.emit("")
+            return
+        if message_type == "chunk":
+            self.parse_llm_stream(message.get("text", ""))
+
     def parse_llm_stream(self, text_chunk: str):
-        for match in re.finditer(r"<rotate:([a-zA-Z0-9_]+)=([-\d.]+)>", text_chunk):
+        self._stream_buffer += text_chunk
+        last_open = self._stream_buffer.rfind("<")
+        last_close = self._stream_buffer.rfind(">")
+        if last_open > last_close:
+            complete_text = self._stream_buffer[:last_open]
+            self._stream_buffer = self._stream_buffer[last_open:]
+        else:
+            complete_text = self._stream_buffer
+            self._stream_buffer = ""
+
+        for match in re.finditer(r"<rotate:([a-zA-Z0-9_]+)=([-\d.]+)>", complete_text):
             bone_name = match.group(1)
             angle = float(match.group(2))
             self.sig_rotate_bone.emit(bone_name, angle)
 
-        for match in re.finditer(r"<expr:([a-zA-Z0-9_]+)=(\d+)>", text_chunk):
+        for match in re.finditer(r"<expr:([a-zA-Z0-9_]+)=(\d+)>", complete_text):
             bone_name = match.group(1)
             idx = int(match.group(2))
             self.sig_set_expression.emit(bone_name, idx)
 
-        for match in re.finditer(r"<move:x=([-\d.]+)(?:,speed=([-\d.]+))?>", text_chunk):
+        for match in re.finditer(r"<move:x=([-\d.]+)(?:,speed=([-\d.]+))?>", complete_text):
             speed = float(match.group(2)) if match.group(2) else 300.0
             self.move_model_x(float(match.group(1)), speed)
+
+        visible_text = re.sub(
+            r"<(?:rotate|expr|move):[^>]*>|</?(?:reply|mood)>",
+            "",
+            complete_text,
+        )
+        if visible_text:
+            self.subtitle_text = f"{self.subtitle_text}{visible_text}"
+            self.sig_set_subtitle.emit(self.subtitle_text)
 
 
 class ControllerCommandServer(threading.Thread):
@@ -713,6 +849,67 @@ class ControllerCommandServer(threading.Thread):
         self.server_socket.close()
 
 
+class LLMListeningServer(threading.Thread):
+    """Receive newline-delimited streamed assistant messages from chat.py."""
+
+    def __init__(
+        self,
+        controller,
+        host=LLM_LISTEN_HOST,
+        port=LLM_LISTEN_PORT,
+    ):
+        super().__init__(daemon=True)
+        self.controller = controller
+        self.host = host
+        self.port = port
+        self.stop_event = threading.Event()
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((host, port))
+        self.server_socket.listen(1)
+        self.server_socket.settimeout(0.5)
+
+    def run(self):
+        print(f"LLM listening server on {self.host}:{self.port}")
+        while not self.stop_event.is_set():
+            try:
+                client, _ = self.server_socket.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self.stop_event.is_set():
+                    break
+                raise
+
+            with client:
+                buffer = b""
+                while not self.stop_event.is_set():
+                    try:
+                        data = client.recv(4096)
+                    except OSError as error:
+                        print(f"LLM client receive error: {error}")
+                        break
+                    if not data:
+                        break
+
+                    buffer += data
+                    while b"\n" in buffer:
+                        raw_message, buffer = buffer.split(b"\n", 1)
+                        if not raw_message.strip():
+                            continue
+                        try:
+                            message = json.loads(raw_message.decode("utf-8"))
+                        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                            print(f"Invalid LLM message: {error}")
+                            continue
+                        if isinstance(message, dict):
+                            self.controller.parse_llm_message(message)
+
+    def stop(self):
+        self.stop_event.set()
+        self.server_socket.close()
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     
@@ -721,10 +918,14 @@ if __name__ == "__main__":
         print(f"Error: {target_file} not found.")
         
     mascot = DesktopMascot(target_file)
-    controller = PuppetController(mascot)
+    subtitle_window = SubtitleWindow(mascot)
+    mascot.set_subtitle_window(subtitle_window)
+    controller = PuppetController(mascot, subtitle_window)
     controller.parse_llm_stream("<expr:face=0>")
     command_server = ControllerCommandServer(controller)
     command_server.start()
+    llm_server = LLMListeningServer(controller)
+    llm_server.start()
     
     debug_overlay = None
     if DEBUG:
@@ -735,9 +936,11 @@ if __name__ == "__main__":
     def quit_app():
         if debug_overlay:
             debug_overlay.close()
+        subtitle_window.close()
         mascot.close()
         mascot.physics.running = False
         command_server.stop()
+        llm_server.stop()
         hotkey_listener.requestInterruption()
         if mascot.physics.isRunning():
             mascot.physics.wait()
