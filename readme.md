@@ -269,9 +269,10 @@ python voice-system/stt.py
 ```
 
 The speech-to-text process sends each finalized sentence to the chat process
-over the local connection at `127.0.0.1:8765`. Live partial text and status
-messages remain in the STT terminal, while model replies stream in the chat
-terminal. Press F9 to stop voice input.
+over the local connection at `127.0.0.1:8765` (STT -> chat). Chat subtitles
+use a separate connection at `127.0.0.1:8766` (chat -> renderer). Live partial
+text and status messages remain in the STT terminal, while model replies
+stream in the chat terminal. Press F9 to stop voice input.
 
 The avatar runs as a borderless, transparent, always-on-top window. Drag it
 with the left mouse button to throw it. The physics system applies gravity,
@@ -307,8 +308,9 @@ They rotate a named bone or select an expression index when passed to
 
 ## External controller script
 
-The renderer starts a localhost command server on `127.0.0.1:8765`. Start the
-renderer first, then run the random controller in a second terminal:
+The renderer starts a localhost command server on `127.0.0.1:8767` for external
+puppet controllers. Start the renderer first, then run the random controller
+in a second terminal:
 
 ```powershell
 python model_desktop_render.py

@@ -29,9 +29,9 @@ MODEL_TO_RUN = "./gguf/lumi_v1.gguf"
 IM_START = "<|im_start|>"
 IM_END = "<|im_end|>"
 VOICE_HOST = "127.0.0.1"
-VOICE_PORT = 8765
-LLM_LISTEN_HOST = "127.0.0.1"
-LLM_LISTEN_PORT = 8766
+VOICE_LISTEN_PORT = 8765       # STT -> chat
+RENDER_HOST = "127.0.0.1"
+RENDER_PORT = 8766             # chat -> renderer subtitles
 
 
 parser = argparse.ArgumentParser(
@@ -98,13 +98,13 @@ parser.add_argument(
 )
 parser.add_argument(
     "--llm-host",
-    default=LLM_LISTEN_HOST,
+    default=RENDER_HOST,
     help="Renderer host for streamed assistant text.",
 )
 parser.add_argument(
     "--llm-port",
     type=int,
-    default=LLM_LISTEN_PORT,
+    default=RENDER_PORT,
     help="Renderer port for streamed assistant text.",
 )
 args = parser.parse_args()
@@ -319,10 +319,10 @@ def start_voice_listener(
     def listen() -> None:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server.bind((VOICE_HOST, VOICE_PORT))
+            server.bind((VOICE_HOST, VOICE_LISTEN_PORT))
             server.listen(1)
             print(
-                f"[Voice] Listening on {VOICE_HOST}:{VOICE_PORT}",
+                f"[Voice] Listening on {VOICE_HOST}:{VOICE_LISTEN_PORT}",
                 file=sys.stderr,
                 flush=True,
             )

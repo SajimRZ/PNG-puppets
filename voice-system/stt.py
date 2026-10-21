@@ -21,7 +21,7 @@ from RealtimeSTT import AudioToTextRecorder
 
 KILL_KEY = "f9"
 CHAT_HOST = "127.0.0.1"
-CHAT_PORT = 8765
+CHAT_PORT = 8765  # STT -> chat
 
 # ---- tweak these if you like -------------------------------------------------
 MAIN_MODEL = "base.en"      # accurate model for final text (tiny.en / base.en / medium.en)

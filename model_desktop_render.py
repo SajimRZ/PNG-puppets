@@ -54,11 +54,13 @@ MAX_THROW_SPEED_X = 1000.0
 MAX_THROW_SPEED_Y = 1500.0
 PLATFORM_Y = None  # Set None to rely on window platforms & screen bottom
 LLM_LISTEN_HOST = "127.0.0.1"
-LLM_LISTEN_PORT = 8766
+LLM_LISTEN_PORT = 8766       # chat -> renderer subtitles
+COMMAND_LISTEN_HOST = "127.0.0.1"
+COMMAND_LISTEN_PORT = 8767   # external controller -> renderer
 
 # --- Subtitle appearance -----------------------------------------------------
 SUBTITLE_FONT_FAMILY = "Segoe UI"
-SUBTITLE_FONT_SIZE = 16
+SUBTITLE_FONT_SIZE = 12
 SUBTITLE_FONT_BOLD = False
 SUBTITLE_FONT_ITALIC = False
 SUBTITLE_FONT_UNDERLINE = False
@@ -805,7 +807,12 @@ class PuppetController(QObject):
 
 class ControllerCommandServer(threading.Thread):
 
-    def __init__(self, controller, host="127.0.0.1", port=8765):
+    def __init__(
+        self,
+        controller,
+        host=COMMAND_LISTEN_HOST,
+        port=COMMAND_LISTEN_PORT,
+    ):
         super().__init__(daemon=True)
         self.controller = controller
         self.host = host
