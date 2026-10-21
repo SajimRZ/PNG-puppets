@@ -1,6 +1,7 @@
 import sys
 import json
 import os
+import random
 import re
 import socket
 import threading
@@ -69,6 +70,32 @@ SUBTITLE_WIDTH = 720
 SUBTITLE_PADDING = 8
 SUBTITLE_ALIGNMENT = Qt.AlignmentFlag.AlignCenter
 SUBTITLE_OFFSET = 18
+
+# Mood names map to the face image order in assets/save4.json:
+# 0 smile, 1 happy, 2 angry, 3 disappointed, 4 yell,
+# 5 embarrassed, 6 flustered.
+MOOD_TO_EXPRESSION = {
+    "neutral": 0,
+    "smile": 0,
+    "calm": 0,
+    "playful": 1,
+    "happy": 1,
+    "cheerful": 1,
+    "bratty": 2,
+    "angry": 2,
+    "mad": 2,
+    "disappointed": 3,
+    "sad": 3,
+    "upset": 3,
+    "yell": 4,
+    "excited": 4,
+    "surprised": 4,
+    "embarrassed": 5,
+    "shy": 5,
+    "flustered": 6,
+}
+MOOD_MIN_SECONDS = 0.5
+MOOD_MAX_SECONDS = 1.5
 # ------------------------------------------------------------------------------
 
 
@@ -718,17 +745,27 @@ class PuppetController(QObject):
     sig_set_expression = pyqtSignal(str, int)
     sig_move_model_x = pyqtSignal(float, float)
     sig_set_subtitle = pyqtSignal(str)
+    sig_mood_chunk = pyqtSignal(str)
+    sig_mood_end = pyqtSignal()
 
     def __init__(self, mascot: DesktopMascot, subtitle_window):
         super().__init__()
         self.mascot = mascot
         self.subtitle_window = subtitle_window
+        self.mood_text = ""
         self.subtitle_text = ""
         self._stream_buffer = ""
+        self._mood_expressions = []
+        self._mood_index = 0
+        self._mood_timer = QTimer(self)
+        self._mood_timer.setSingleShot(True)
+        self._mood_timer.timeout.connect(self._advance_mood)
         self.sig_rotate_bone.connect(self._handle_rotate_bone)
         self.sig_set_expression.connect(self._handle_set_expression)
         self.sig_move_model_x.connect(self._handle_move_model_x)
         self.sig_set_subtitle.connect(self._handle_set_subtitle)
+        self.sig_mood_chunk.connect(self._handle_mood_chunk)
+        self.sig_mood_end.connect(self._start_mood_sequence)
 
     def move_model_x(self, x_position, speed=300.0):
         self.sig_move_model_x.emit(float(x_position), float(speed))
@@ -760,14 +797,58 @@ class PuppetController(QObject):
     def _handle_set_subtitle(self, text):
         self.subtitle_window.set_text(text)
 
+    @pyqtSlot(str)
+    def _handle_mood_chunk(self, text):
+        self.mood_text += text
+
+    @pyqtSlot()
+    def _start_mood_sequence(self):
+        mood_names = [
+            mood.strip().lower()
+            for mood in self.mood_text.split("-")
+            if mood.strip()
+        ]
+        if not mood_names:
+            mood_names = ["neutral"]
+
+        self._mood_expressions = [
+            MOOD_TO_EXPRESSION.get(mood, 0) for mood in mood_names
+        ]
+        self._mood_index = 0
+        self._mood_timer.stop()
+        self._advance_mood()
+
+    def _advance_mood(self):
+        if self._mood_index >= len(self._mood_expressions):
+            resting_expression = random.choice(self._mood_expressions or [0])
+            self.sig_set_expression.emit("face", resting_expression)
+            return
+
+        expression_index = self._mood_expressions[self._mood_index]
+        self.sig_set_expression.emit("face", expression_index)
+        self._mood_index += 1
+        self._mood_timer.start(
+            int(random.uniform(MOOD_MIN_SECONDS, MOOD_MAX_SECONDS) * 1000)
+        )
+
     def parse_llm_message(self, message):
         message_type = message.get("type")
         if message_type == "start":
+            self._mood_timer.stop()
+            self._mood_expressions = []
+            self._mood_index = 0
+            self.mood_text = ""
             self.subtitle_text = ""
             self._stream_buffer = ""
             self.sig_set_subtitle.emit("")
             return
-        if message_type == "chunk":
+        if message_type == "mood":
+            self.sig_mood_chunk.emit(message.get("text", ""))
+            return
+        if message_type == "mood_end":
+            self.sig_mood_end.emit()
+            return
+        if message_type == "reply":
             self.parse_llm_stream(message.get("text", ""))
 
     def parse_llm_stream(self, text_chunk: str):

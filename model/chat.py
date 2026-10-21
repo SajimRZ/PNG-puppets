@@ -7,6 +7,7 @@ import sys
 import threading
 from typing import List, Dict
 
+import keyboard
 from llama_cpp import Llama
 
 
@@ -32,6 +33,7 @@ VOICE_HOST = "127.0.0.1"
 VOICE_LISTEN_PORT = 8765       # STT -> chat
 RENDER_HOST = "127.0.0.1"
 RENDER_PORT = 8766             # chat -> renderer subtitles
+KILL_KEY = "f10"
 
 
 parser = argparse.ArgumentParser(
@@ -110,6 +112,16 @@ parser.add_argument(
 args = parser.parse_args()
 
 
+def kill() -> None:
+    """Stop chat immediately, including model generation and listener threads."""
+    print(
+        f"\n[Chat] {KILL_KEY.upper()} pressed - shutting down.",
+        file=sys.stderr,
+        flush=True,
+    )
+    os._exit(0)
+
+
 class LLMStreamClient:
     """Send streamed assistant text to the optional avatar renderer."""
 
@@ -155,6 +167,77 @@ class LLMStreamClient:
             except OSError:
                 pass
             self.connection = None
+
+
+class TaggedResponseStreamer:
+    """Split streamed model output into mood and reply sections."""
+
+    OPEN_TAGS = ("<mood>", "<reply>")
+
+    def __init__(self, on_section, on_section_end):
+        self.on_section = on_section
+        self.on_section_end = on_section_end
+        self.buffer = ""
+        self.section = None
+
+    def feed(self, text: str) -> None:
+        self.buffer += text
+        self._process()
+
+    def finish(self) -> None:
+        if self.section and self.buffer:
+            self.on_section(self.section, self.buffer)
+        self.buffer = ""
+        self.section = None
+
+    def _process(self) -> None:
+        while self.buffer:
+            if self.section is None:
+                positions = [
+                    (self.buffer.find(tag), tag)
+                    for tag in self.OPEN_TAGS
+                    if self.buffer.find(tag) >= 0
+                ]
+                if not positions:
+                    self.buffer = self._retain_partial_open_tag()
+                    return
+
+                _, tag = min(positions)
+                tag_start = self.buffer.find(tag)
+                self.buffer = self.buffer[tag_start + len(tag):]
+                self.section = tag[1:-1]
+                continue
+
+            close_tag = f"</{self.section}>"
+            close_start = self.buffer.find(close_tag)
+            if close_start >= 0:
+                content = self.buffer[:close_start]
+                self.buffer = self.buffer[close_start + len(close_tag):]
+                if content:
+                    self.on_section(self.section, content)
+                self.on_section_end(self.section)
+                self.section = None
+                continue
+
+            safe_length = self._safe_content_length(self.buffer, close_tag)
+            if safe_length:
+                self.on_section(self.section, self.buffer[:safe_length])
+                self.buffer = self.buffer[safe_length:]
+            return
+
+    def _retain_partial_open_tag(self) -> str:
+        for index in range(max(0, len(self.buffer) - 6), len(self.buffer)):
+            suffix = self.buffer[index:]
+            if any(tag.startswith(suffix) for tag in self.OPEN_TAGS):
+                return suffix
+        return ""
+
+    @staticmethod
+    def _safe_content_length(text: str, close_tag: str) -> int:
+        for length in range(min(len(close_tag) - 1, len(text)), 0, -1):
+            if text.endswith(close_tag[:length]):
+                return len(text) - length
+        return len(text)
 
 
 def format_messages(messages: List[Dict[str, str]], add_generation_prompt: bool = True) -> str:
@@ -281,12 +364,16 @@ def process_input(
     llm_client = LLMStreamClient(args.llm_host, args.llm_port)
     llm_client.connect()
     llm_client.send("start")
+    tagged_stream = TaggedResponseStreamer(
+        lambda section, text: llm_client.send(section, text),
+        lambda section: llm_client.send(f"{section}_end"),
+    )
 
     try:
         for chunk in stream_chat_reply(history):
             print(chunk, end="", flush=True)
             assistant_reply += chunk
-            llm_client.send("chunk", chunk)
+            tagged_stream.feed(chunk)
     except KeyboardInterrupt:
         print("\n[Generation interrupted]")
         # Keep only generated text if any; the next prompt remains usable.
@@ -296,11 +383,13 @@ def process_input(
         # leave history ending with two consecutive user messages.
         if history and history[-1]["role"] == "user":
             history.pop()
+        tagged_stream.finish()
         llm_client.send("end")
         llm_client.close()
         return history, True
 
     print()
+    tagged_stream.finish()
     llm_client.send("end")
     llm_client.close()
     assistant_reply = assistant_reply.strip()
@@ -410,6 +499,13 @@ if __name__ == "__main__":
     print(f"Loading GGUF model: {os.path.abspath(args.model_path)}")
     print(f"Context size: {args.n_ctx}")
     print(f"GPU layers: {args.n_gpu_layers}")
+
+    keyboard.add_hotkey(KILL_KEY, kill)
+    print(
+        f"[Chat] Press {KILL_KEY.upper()} to stop.",
+        file=sys.stderr,
+        flush=True,
+    )
 
     llm = Llama(
         model_path=args.model_path,

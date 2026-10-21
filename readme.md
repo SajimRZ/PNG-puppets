@@ -233,6 +233,11 @@ response to its local LLM listener. The renderer listens on
 avatar while it is generated. The stream is optional: chat continues normally
 if the renderer is not running. Override the endpoint with:
 
+The renderer stream uses newline-delimited JSON messages. Chat sends the
+`<mood>...</mood>` section as `mood` messages and the `<reply>...</reply>`
+section as `reply` messages while generation is still in progress, so the
+renderer can handle them independently.
+
 ```powershell
 python model/chat.py --llm-host 127.0.0.1 --llm-port 8766
 ```
