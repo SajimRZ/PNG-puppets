@@ -218,6 +218,44 @@ The renderer currently loads `assets/save3.json` by default. To use another
 rig, change the `target_file` value near the bottom of
 `model_desktop_render.py`.
 
+## Run the Lumi GGUF chat
+
+`model/chat.py` loads `gguf/lumi_v1.gguf`, requires GPU offload support, and
+streams each response directly to the terminal:
+
+```powershell
+python model/chat.py
+```
+
+The defaults can be edited at the top of `model/chat.py`. Common generation
+settings are also available as command-line options:
+
+```powershell
+python model/chat.py --temperature 0.7 --top-k 40 --top-p 0.95 --max-tokens 512
+```
+
+The script sets `n_gpu_layers=-1` and exits with an error if the installed
+`llama-cpp-python` build does not support GPU offload. Use `/exit` or
+`Ctrl+C` to leave the chat.
+
+To use the voice system as the chat input, run the two programs in separate
+terminals. Start the chat listener first:
+
+```powershell
+python model/chat.py
+```
+
+Then start speech-to-text in the second terminal:
+
+```powershell
+python voice-system/stt.py
+```
+
+The speech-to-text process sends each finalized sentence to the chat process
+over the local connection at `127.0.0.1:8765`. Live partial text and status
+messages remain in the STT terminal, while model replies stream in the chat
+terminal. Press F9 to stop voice input.
+
 The avatar runs as a borderless, transparent, always-on-top window. Drag it
 with the left mouse button to throw it. The physics system applies gravity,
 horizontal wall collisions, friction, bounce, and velocity-based limb movement.

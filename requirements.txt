@@ -9,6 +9,8 @@ torch==2.13.0+cu126
 torchvision==0.28.0+cu126
 torchaudio==2.11.0+cu126
 
+# Runtime dependency of the locally installed llama-cpp-python wheel.
+diskcache>=5.6.1
 
 # ---- Core ML / training stack ----
 transformers==5.5.0

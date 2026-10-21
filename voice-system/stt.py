@@ -8,10 +8,11 @@ Always-listening, streaming speech-to-text.
 
 Run:  python stt.py
 Run on CPU: python stt.py --cpu
-Pipe: python stt.py | python my_chatbot.py
+The separate chat process must be running on 127.0.0.1:8765.
 """
 import argparse
 import os
+import socket
 import sys
 
 import keyboard
@@ -19,18 +20,20 @@ import torch
 from RealtimeSTT import AudioToTextRecorder
 
 KILL_KEY = "f9"
+CHAT_HOST = "127.0.0.1"
+CHAT_PORT = 8765
 
 # ---- tweak these if you like -------------------------------------------------
 MAIN_MODEL = "small.en"      # accurate model for final text (tiny.en / base.en / medium.en)
 LIVE_MODEL = "tiny.en"       # fast model for the live partial text
-ENABLE_PARTIAL_TRANSCRIPTION = True
-USE_MAIN_MODEL_FOR_PARTIALS = True
+ENABLE_PARTIAL_TRANSCRIPTION = False
+USE_MAIN_MODEL_FOR_PARTIALS = False
 USE_GPU = True               # override with --cpu/--gpu or STT_USE_GPU=0/1
 GPU_DEVICE_INDEX = 0
 GPU_COMPUTE_TYPE = "float16"
 CPU_COMPUTE_TYPE = "int8"
-MAIN_BATCH_SIZE = 8
-LIVE_BATCH_SIZE = 8
+MAIN_BATCH_SIZE = 4
+LIVE_BATCH_SIZE = 4
 LANGUAGE = "en"              # use a non-.en model (e.g. "small") for other languages
 END_OF_SPEECH_SILENCE = 1.0  # seconds of silence before a sentence is "final"
 SILERO_SENSITIVITY = 0.25   # lower this to reduce background-noise triggers
@@ -58,6 +61,19 @@ def on_partial(text):
 
 def on_transcription_start(_audio):
     print("[STT] Transcribing...", file=sys.stderr, flush=True)
+
+
+def send_to_chat(text):
+    """Send one finalized transcription to the chat process."""
+    try:
+        with socket.create_connection((CHAT_HOST, CHAT_PORT), timeout=1.0) as connection:
+            connection.sendall((text.strip() + "\n").encode("utf-8"))
+    except OSError as error:
+        print(
+            f"[STT] Could not send to chat at {CHAT_HOST}:{CHAT_PORT}: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def parse_args():
@@ -136,4 +152,6 @@ if __name__ == "__main__":  # required: RealtimeSTT uses multiprocessing
         final_text = recorder.text()      # blocks until you finish a sentence
         if final_text.strip():
             sys.stderr.write("\r\033[K")  # clear the partial line
-            print(final_text.strip(), flush=True)
+            text = final_text.strip()
+            print(text, flush=True)
+            send_to_chat(text)
